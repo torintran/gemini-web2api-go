@@ -22,6 +22,11 @@ Internet → Cloudflare Edge → cloudflared (ns cloudflare, ×2) → Service DN
 
 Không có Ingress, không có Traefik, không mở port 80/443 trên VPS.
 
+Hai cách đưa client vào, chọn một:
+
+- **Nội bộ (mục 3.A):** không tạo public hostname cho Gemini. New API trong cùng cluster gọi `ClusterIP`. Chỉ New API được public. Admin mở qua Tailscale bằng `port-forward`.
+- **Public (mục 3.B):** thêm hostname trên tunnel hiện có, trỏ thẳng service `:8083`.
+
 ## Bố cục repo
 
 ```text
@@ -181,10 +186,17 @@ Cách này secret chỉ nằm trong cluster, mất cluster là mất key (vẫn 
 
 ### Lấy lại key
 
+Hai giá trị khác nhau. Ô đăng nhập admin nhận `admin-token`. Client và kênh New API nhận `api-key` (`sk-gemini-...`).
+
 ```bash
+kubectl -n gemini get secret gemini-web2api-secrets \
+  -o jsonpath='{.data.admin-token}' | base64 -d; echo
+
 kubectl -n gemini get secret gemini-web2api-secrets \
   -o jsonpath='{.data.api-key}' | base64 -d; echo
 ```
+
+`install.sh` cũng ghi cả hai vào `deploy/k3s/secrets/app-secrets.env` (`ADMIN_TOKEN`, `API_KEY`). File này đã gitignore.
 
 ## 2. Deploy
 
@@ -205,7 +217,33 @@ Kỳ vọng: pod `1/1 Running`, PVC `Bound`.
 
 Lần boot đầu, app tải `cl100k_base` (~3MB) vào `/data/tiktoken`. Nếu egress 443 bị chặn, log sẽ báo `[tokenizer] init failed` và app vẫn chạy với ước lượng chars/4.
 
-## 3. Thêm public hostname vào tunnel hiện có
+## 3. Đưa traffic tới app
+
+Service là `ClusterIP`. Cổng 8083 chỉ có trong cluster (`gemini-web2api.gemini.svc.cluster.local`). Pod nghe 8083 trong network namespace của nó. Trên host, kể cả IP Tailscale, không có process nào lắng `8083`. `ss -lntp | grep 8083` trên node không ra dòng nào là đúng.
+
+NetworkPolicy của app chỉ siết **egress**. Pod khác trong cluster (New API) gọi được service mà không cần sửa policy.
+
+### 3.A. Không public Gemini — New API trong cluster
+
+Dùng khi client đi qua New API (hoặc One API) và Gemini không có hostname riêng.
+
+1. Cài New API **trong cùng k3s**. DNS `*.svc.cluster.local` chỉ phân giải được trong cluster. New API đặt ngoài VPS thì không tới Service này.
+2. Public hostname trên tunnel trỏ vào Service của New API (cổng mặc định `3000`), không trỏ vào `:8083`.
+3. Trong New API: Kênh → thêm kênh, loại OpenAI.
+
+| Field | Giá trị |
+|---|---|
+| Base URL | `http://gemini-web2api.gemini.svc.cluster.local:8083` |
+| Key | `api-key` trong secret (`sk-gemini-...`) |
+| Models | `gemini-3.6-flash` (đúng tên upstream) |
+
+Không ghi `/v1` ở cuối Base URL. New API tự nối `/v1/chat/completions`. Thêm `/v1` thành `/v1/v1/...` và test kênh fail.
+
+Client đang gửi tên OpenAI thì điền model mapping, ví dụ `{"gpt-4o": "gemini-3.6-flash"}`. Thêm ChatGPT sau này là thêm một kênh nữa. Client vẫn một base URL và một token của New API.
+
+Cookie không nhập trên New API. New API không proxy `/admin`. Làm mục 6, rồi bấm test kênh.
+
+### 3.B. Public hostname trên tunnel hiện có
 
 Zero Trust → **Networks** → **Tunnels** → tunnel của bạn → **Public Hostname** → **Add a public hostname**:
 
@@ -231,7 +269,9 @@ Vài điểm cần biết:
 
 ## 4. Cấu hình Cloudflare
 
-### 4.1 Access cho /admin (bắt buộc)
+Chỉ khi đi đường 3.B (Gemini có public hostname). Đường 3.A bỏ cả mục này. Admin không ra internet. Rate limit và cache áp cho hostname của New API nếu hostname đó đi qua Cloudflare.
+
+### 4.1 Access cho /admin (bắt buộc ở đường 3.B)
 
 Admin của app mặc định **không có mật khẩu** nếu `ADMIN_TOKEN` rỗng. Ở đây đã set qua Secret, nhưng vẫn nên có lớp Access.
 
@@ -261,6 +301,8 @@ Security → **WAF** → **Rate limiting rules**:
 
 ## 5. Test
 
+Đường 3.B, gọi thẳng hostname Gemini. Đường 3.A thì bấm test kênh trong New API sau khi cookie đã **正常** (mục 6). Request dưới đây dùng `api-key`, không dùng `admin-token`.
+
 ```bash
 curl -fsS https://gemini.example.com/
 
@@ -289,9 +331,40 @@ Thấy `data: {...}` ra từng đoạn là ổn.
 
 ## 6. Cookie Google + cấu hình cho script
 
-1. Mở `https://gemini.example.com/admin` → qua Access → nhập `ADMIN_TOKEN`.
-2. **Cookie pool** → thêm cookie từ `gemini.google.com` (tài khoản Google **riêng**, không dùng tài khoản chính).
-3. Kiểm tra health; lỗi thường do thiếu `SAPISID` / `__Secure-1PSID` hoặc cookie hết hạn.
+Chưa có cookie thì `/v1/models` vẫn trả lời, nhưng chat báo model không dùng được vì thiếu tài khoản Google. Dùng tài khoản Google **phụ**.
+
+### 6.1. Mở admin
+
+**Đường 3.A (không public).** Trên node, buộc `port-forward` vào IP Tailscale của chính node đó (ví dụ `100.x.y.z`). Lệnh không có `--address` chỉ bind `127.0.0.1` của node, máy khác trên tailnet vẫn không vào được.
+
+```bash
+kubectl -n gemini port-forward --address 100.x.y.z svc/gemini-web2api 8083:8083
+```
+
+Giữ cửa sổ này mở. Trên máy bạn: `http://100.x.y.z:8083/admin`. Tắt lệnh là cổng đóng.
+
+**Đường 3.B (đã public).** Mở `https://gemini.example.com/admin` sau khi Access (mục 4.1) cho qua.
+
+Ô token nhận `admin-token`, không nhận `sk-gemini-...`. Lấy lại bằng lệnh ở mục 1.
+
+### 6.2. Xuất cookie bằng Firefox
+
+Dùng Firefox. Chrome gắn phiên với máy (Device Bound Session Credentials). Cookie xuất từ Chrome thường chết sau vài chục phút đến vài giờ, và `__Secure-1PSIDTS` không gia hạn được.
+
+1. Firefox đăng nhập [gemini.google.com](https://gemini.google.com).
+2. F12 → **Network** → tải lại trang → chọn một request tới `gemini.google.com`.
+3. **Headers** → **Request Headers** → copy nguyên giá trị sau `Cookie:`.
+
+Đó là một dòng `SID=...; HSID=...; SSID=...; APISID=...; SAPISID=...; __Secure-1PSID=...; __Secure-1PSIDTS=...`. Phải còn `SAPISID` và `__Secure-1PSID`. `document.cookie` trong Console bỏ qua cookie HttpOnly, nên thiếu đúng các mục này.
+
+### 6.3. Import trên panel
+
+1. Thanh bên → **Cookie 池** → **+ 导入 Cookie**.
+2. Giữ tab **整串粘贴（推荐）**. Ô **标签** ghi email cho dễ nhận, có thể để trống.
+3. Dán nguyên dòng cookie. Bấm **导入**. Thiếu `SAPISID` thì panel từ chối.
+4. Dòng mới ở trạng thái **待检测**. Bấm **检测**.
+
+`✓` và trạng thái **正常** là đăng nhập còn sống. `✗` hoặc **疑似失效** thì xuất lại từ Firefox và import lại. Panel không gửi ngược cookie đầy đủ về trình duyệt. Danh sách chỉ hiện số cookie, vài mục chính, và 4 ký tự cuối của `SAPISID`.
 
 Runtime config gợi ý cho kịch bản:
 
@@ -333,7 +406,9 @@ for chunk in resp:
 
 Với LobeChat/Open WebUI/Chatbox: provider `OpenAI Compatible`, base URL `https://gemini.example.com/v1`, model `gemini-3.6-flash`.
 
-Client hardcode `gpt-4o`: project không map tên OpenAI. Đổi model trong client, hoặc đặt `new-api`/`one-api` phía trước để map.
+Đường 3.A thì client không gọi Gemini. Base URL là `https://<hostname-new-api>/v1`, API key là token tạo trong New API. Key `sk-gemini-...` chỉ nằm trong cấu hình kênh.
+
+Client hardcode `gpt-4o`: project không map tên OpenAI. Đổi model trong client, hoặc dùng model mapping của New API (mục 3.A).
 
 ## 8. Vận hành
 
@@ -399,6 +474,11 @@ Xoá namespace là xoá PVC. Backup trước.
 | Pod `Init:CrashLoopBackOff` | Init container không chown được volume | `kubectl -n gemini logs pod/... -c fix-data-permissions` |
 | `unable to open database file (14)` | Volume thuộc root, app chạy uid 65532 | Init container phải chown; kiểm tra hostPath |
 | `CreateContainerConfigError` | Thiếu Secret `gemini-web2api-secrets` | Apply sealed secret; kiểm tra `kubectl -n gemini get secret` |
+| Tailscale IP `:8083` từ chối kết nối | Service là `ClusterIP`, host không lắng 8083 | `port-forward --address <ip-tailscale>` (mục 6.1). `ss -lntp \| grep 8083` trống là đúng |
+| Admin báo token sai | Đang dán `api-key` (`sk-gemini-...`) | Dán `admin-token` (mục 1) |
+| Import cookie báo thiếu `SAPISID` | Copy từ `document.cookie` hoặc copy thiếu | Lấy header `Cookie` của request thật trong Firefox (mục 6.2) |
+| Kênh New API `/v1/v1/...` | Base URL đã có hậu tố `/v1` | Base URL dừng ở `:8083` (mục 3.A) |
+| New API không resolve được service | New API không nằm trong cluster | Cài New API vào cùng k3s |
 | Secret không xuất hiện sau khi apply SealedSecret | Seal bằng key của cluster khác | Seal lại: `kubeseal --fetch-cert` từ cluster này |
 | Cloudflare 502 | cloudflared không tới được service | Kiểm tra URL hostname, pod Ready, DNS trong cluster |
 | Cloudflare 524 | origin không trả byte đầu trong 100s | Dùng `stream: true` |
@@ -416,9 +496,9 @@ Xoá namespace là xoá PVC. Backup trước.
 - [ ] `ADMIN_TOKEN` 32 bytes hex, không nằm trong git.
 - [ ] `API_KEY` set qua Secret (bị lock, đổi bằng rollout restart).
 - [ ] Sealed secret đã commit, plaintext `.env` không commit.
-- [ ] Access bảo vệ `/admin`.
-- [ ] WAF rate limit `/v1/*`.
-- [ ] Cache bypass + tắt Bot Fight Mode cho hostname API.
+- [ ] Đường 3.A: New API cùng cluster, base URL không có `/v1`, hostname public không trỏ Gemini.
+- [ ] Đường 3.B: Access bảo vệ `/admin`, WAF rate limit `/v1/*`, cache bypass, tắt Bot Fight Mode.
+- [ ] Cookie pool đã **检测** ra **正常** (Firefox, không phải `document.cookie`).
 - [ ] Container nonroot, read-only root FS, drop ALL caps.
 - [ ] NetworkPolicy chặn egress private/link-local.
 - [ ] Tunnel có 2 connector; không phụ thuộc 1 pod.
@@ -446,9 +526,15 @@ kubectl apply -f deploy/k3s/overlays/prod/sealed-app-secrets.yaml
 kubectl apply -k deploy/k3s/overlays/prod
 kubectl -n gemini get pods,pvc
 
-# 3. Zero Trust: thêm public hostname
+# 3.A Không public — New API trong cùng cluster, kênh trỏ
+#    http://gemini-web2api.gemini.svc.cluster.local:8083
+#    (không thêm /v1). Hostname public chỉ trỏ New API.
+# 3.B Hoặc public thẳng Gemini:
 #    gemini.example.com → http://gemini-web2api.gemini.svc.cluster.local:8083
 
-# 4. Test
+# 4. Admin: port-forward --address <ip-tailscale> rồi nhập admin-token.
+#    Cookie 池 → + 导入 Cookie → dán header Cookie từ Firefox → 检测.
+
+# 5. Test (đường public). Đường 3.A thì test kênh trong New API.
 curl -fsS https://gemini.example.com/v1/models -H "Authorization: Bearer $API_KEY"
 ```
