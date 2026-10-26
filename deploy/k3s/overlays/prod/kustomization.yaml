@@ -3,8 +3,8 @@ kind: Kustomization
 namespace: gemini
 resources:
   - ../../base
-# Image do CI trong repo này build rồi đẩy lên GHCR của bạn.
-# Mỗi lần build lại nên dùng tag mới, vì IfNotPresent sẽ không kéo lại tag cũ.
+# Image do CI workflow_dispatch đẩy lên GHCR. Tag git v4.26.0 chưa có bản build.
+# latest là tag di động; deployment dùng imagePullPolicy Always để node kéo lại.
 images:
   - name: ghcr.io/torintran/gemini-web2api-go
-    newTag: v4.26.0
+    newTag: latest

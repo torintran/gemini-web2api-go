@@ -55,7 +55,7 @@ spec:
         - name: app
           # Tag thật được pin trong overlays/prod/kustomization.yaml.
           image: ghcr.io/torintran/gemini-web2api-go
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           args:
             - "--db"
             - "/data/gemini.db"
