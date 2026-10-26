@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gemini-web2api
+  namespace: gemini
+  labels:
+    app.kubernetes.io/name: gemini-web2api
+spec:
+  # SQLite + conversation state trong RAM: chỉ chạy 1 replica.
+  # Không đặt PDB: minAvailable=1 trên 1 replica sẽ chặn drain node.
+  replicas: 1
+  strategy:
+    # PVC local-path là RWO; Recreate tránh 2 pod cùng mount.
+    type: Recreate
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gemini-web2api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gemini-web2api
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # local-path là hostPath nên fsGroup có thể không được áp dụng.
+        # initContainer bên dưới chown thực tế; fsGroup để dành cho storage khác.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: fix-data-permissions
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              mkdir -p /data/tiktoken
+              chown -R 65532:65532 /data
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "DAC_OVERRIDE", "FOWNER"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      containers:
+        - name: app
+          # Tag thật được pin trong overlays/prod/kustomization.yaml.
+          image: ghcr.io/torintran/gemini-web2api-go
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--db"
+            - "/data/gemini.db"
+            - "--port"
+            - "8083"
+          ports:
+            - name: http
+              containerPort: 8083
+              protocol: TCP
+          env:
+            - name: TZ
+              value: Asia/Ho_Chi_Minh
+            - name: HOME
+              value: /tmp
+            - name: TMPDIR
+              value: /tmp
+            # tiktoken tải cl100k_base (~3MB) lần đầu; cache vào volume
+            # vì root FS là read-only.
+            - name: TIKTOKEN_CACHE_DIR
+              value: /data/tiktoken
+            # Secret gemini-web2api-secrets tạo từ SealedSecret (khuyến nghị)
+            # hoặc bằng kubectl create secret (xem README).
+            # API_KEY qua env sẽ bị "lock": không đổi được trong admin UI.
+            - name: ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-web2api-secrets
+                  key: admin-token
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gemini-web2api-secrets
+                  key: api-key
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          startupProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: gemini-web2api-data
+        - name: tmp
+          emptyDir: {}

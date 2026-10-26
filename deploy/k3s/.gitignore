@@ -1,0 +1,8 @@
+# Plaintext secrets: chỉ tồn tại local
+secrets/
+*.env
+
+# Secret thô không commit; ciphertext SealedSecret thì commit được.
+secret.yaml
+secrets.yaml
+*.secret.yaml

@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gemini-web2api-data
+  namespace: gemini
+spec:
+  accessModes:
+    - ReadWriteOnce
+  # k3s mặc định có StorageClass local-path.
+  # Nếu cluster dùng storage class khác, sửa hoặc bỏ dòng này.
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
